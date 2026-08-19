@@ -22,6 +22,9 @@ final class SwitcherViewModel: ObservableObject {
     /// while the palette stays open). Published: it drives the current-dot.
     @Published private(set) var currentWindowID: WindowID?
 
+    /// Live RAM footprint per app pid; sampled only while visible.
+    @Published var memoryByApp: [pid_t: UInt64] = [:]
+
     /// Called when the user clicks a card.
     var onActivate: ((WindowInfo) -> Void)?
     /// Called when the user asks to close a window (hover ✕ or ⌘W).

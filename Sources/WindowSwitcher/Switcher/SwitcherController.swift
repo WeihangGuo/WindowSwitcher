@@ -18,11 +18,16 @@ final class SwitcherController {
     /// Modifiers whose release commits the selection (empty = sticky mode).
     private var armedModifiers: NSEvent.ModifierFlags = []
 
+    /// Whether a switcher session is on screen (for callers that must route
+    /// around other guards, e.g. the hotkey toggle when AX trust is lost).
+    var isSessionVisible: Bool { isVisible }
+
     private var localKeyMonitor: Any?
     private var localFlagsMonitor: Any?
     private var globalFlagsMonitor: Any?
     private var modifierPollTimer: Timer?
     private var holdRepeatTimer: Timer?
+    private var memoryTimer: Timer?
 
     /// Where the user last dragged the panel (its center). Reused on the
     /// next open while it still fits the active screen; nil = center.
@@ -43,6 +48,13 @@ final class SwitcherController {
         }
         model.onClose = { [weak self] window in
             self?.closeWindow(window)
+        }
+        // Losing key status while armed (user clicked into another app while
+        // still holding the modifier) must disarm release-to-activate, or
+        // the eventual release would steal focus from the window they chose.
+        // The panel itself stays visible — this never dismisses.
+        panel.onResignKey = { [weak self] in
+            self?.disarm()
         }
 
         // The palette can stay open indefinitely; keep it fed with live
@@ -202,6 +214,27 @@ final class SwitcherController {
             guard let self, self.isVisible else { return }
             self.model.merge(fresh: fresh)
         }
+
+        // Live per-app RAM readout; sampled only while visible so idle
+        // cost stays zero.
+        refreshMemory()
+        let memory = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.refreshMemory()
+        }
+        RunLoop.main.add(memory, forMode: .common)
+        memoryTimer = memory
+    }
+
+    private func refreshMemory() {
+        let pids = Set(model.groups.map(\.id))
+        guard !pids.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let sample = MemorySampler.sample(appPids: pids)
+            DispatchQueue.main.async {
+                guard let self, self.isVisible else { return }
+                self.model.memoryByApp = sample
+            }
+        }
     }
 
     /// Close a window without leaving the switcher (hover ✕ or ⌘W), so
@@ -233,6 +266,16 @@ final class SwitcherController {
         }
     }
 
+    /// Convert an armed (release-to-activate) session into a sticky one.
+    private func disarm() {
+        guard isVisible, !armedModifiers.isEmpty else { return }
+        armedModifiers = []
+        modifierPollTimer?.invalidate()
+        modifierPollTimer = nil
+        holdRepeatTimer?.invalidate()
+        holdRepeatTimer = nil
+    }
+
     private func dismiss() {
         guard isVisible else { return }
         isVisible = false
@@ -241,6 +284,8 @@ final class SwitcherController {
         modifierPollTimer = nil
         holdRepeatTimer?.invalidate()
         holdRepeatTimer = nil
+        memoryTimer?.invalidate()
+        memoryTimer = nil
 
         for monitor in [localKeyMonitor, localFlagsMonitor, globalFlagsMonitor] {
             if let monitor { NSEvent.removeMonitor(monitor) }

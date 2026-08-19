@@ -13,6 +13,10 @@ final class SwitcherHostingView: NSHostingView<SwitcherView> {
 /// bar. It floats above all windows (.popUpMenu level) and stays visible
 /// when it loses key status; only an explicit pick or dismissal removes it.
 final class SwitcherPanel: NSPanel {
+    /// Fired when the panel loses key status (e.g. the user clicked into
+    /// another app). Used to DISARM release-to-activate, never to dismiss.
+    var onResignKey: (() -> Void)?
+
     init() {
         super.init(
             contentRect: .zero,
@@ -39,4 +43,9 @@ final class SwitcherPanel: NSPanel {
     // makeKeyAndOrderFront silently fails to deliver any keyboard events.
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    override func resignKey() {
+        super.resignKey()
+        onResignKey?()
+    }
 }

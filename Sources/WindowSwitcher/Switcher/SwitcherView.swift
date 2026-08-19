@@ -33,6 +33,12 @@ struct SwitcherView: View {
 
     private let cornerRadius = SwitcherLayout.cornerRadius
 
+    /// Uniform GB readout for every app (user preference), Activity-Monitor
+    /// binary GB.
+    static func memoryString(_ bytes: UInt64) -> String {
+        String(format: "%.2f GB", Double(bytes) / 1_073_741_824)
+    }
+
     var body: some View {
         Group {
             if model.isEmpty {
@@ -109,6 +115,11 @@ struct SwitcherView: View {
                     .padding(.vertical, 1)
                     .background(Capsule().fill(Color.primary.opacity(0.08)))
                 Spacer(minLength: 0)
+                if let bytes = model.memoryByApp[group.id] {
+                    Text(Self.memoryString(bytes))
+                        .font(.system(size: 10, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
             // Pinned so the model's geometry math stays exact.
             .frame(height: SwitcherLayout.headerHeight)

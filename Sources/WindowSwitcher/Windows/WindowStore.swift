@@ -59,6 +59,11 @@ final class WindowStore {
     /// a window the user actually focused in the meantime.
     private var focusCounter: UInt64 = 1 << 32
 
+    /// Apps hidden with ⌘H. Their windows vanish from CGWindowList (like
+    /// minimized ones) but must stay listed and switchable — exempt them
+    /// from the liveness eviction.
+    private var hiddenPids: Set<pid_t> = []
+
     /// Consecutive failed fetches per app; quarantined apps are skipped in
     /// reconcile until their backoff expires so one hung app cannot stall
     /// every open.
@@ -126,9 +131,25 @@ final class WindowStore {
                 self.refreshApp(pid: pid)
             }
         })
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.didHideApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            self?.hiddenPids.insert(app.processIdentifier)
+        })
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.didUnhideApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            self?.hiddenPids.remove(app.processIdentifier)
+            self?.refreshApp(pid: app.processIdentifier)
+        })
 
         for app in NSWorkspace.shared.runningApplications {
             watchAppIfEligible(app)
+            if app.isHidden {
+                hiddenPids.insert(app.processIdentifier)
+            }
         }
         seedInitialOrderFromZOrder()
     }
@@ -224,6 +245,7 @@ final class WindowStore {
         fetchFailures.removeValue(forKey: pid)
         quarantinedUntil.removeValue(forKey: pid)
         attemptedBruteForce.removeValue(forKey: pid)
+        hiddenPids.remove(pid)
         for id in windows.keys where id.pid == pid {
             windows.removeValue(forKey: id)
             titleDebounce.removeValue(forKey: id)?.cancel()
@@ -687,9 +709,13 @@ final class WindowStore {
                     self.attemptedBruteForce[pid, default: []].formUnion(ids)
                 }
                 // Evict windows that no longer exist anywhere. Minimized
-                // windows are exempt (they may be absent from the list).
+                // windows and windows of ⌘H-hidden apps are exempt (both
+                // are absent from the window server's list while alive).
                 for (id, info) in self.windows {
-                    guard let cgID = info.cgWindowID, !info.isMinimized, !liveIDs.contains(cgID) else { continue }
+                    guard let cgID = info.cgWindowID,
+                          !info.isMinimized,
+                          !self.hiddenPids.contains(id.pid),
+                          !liveIDs.contains(cgID) else { continue }
                     self.removeWindow(id: id)
                 }
                 completion(self.snapshotGroups())

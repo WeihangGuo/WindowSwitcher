@@ -73,6 +73,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func hotkeyPressed(forward: Bool) {
+        // A visible session must always receive the hotkey — it's the
+        // documented toggle-close — even if AX trust vanished after it
+        // opened (revoked mid-session, rebuilt binary).
+        if let switcher, switcher.isSessionVisible {
+            switcher.handleHotkey(forward: forward)
+            return
+        }
         // Trust can silently vanish (e.g. the binary was rebuilt): guide the
         // user instead of showing a half-dead panel.
         guard AX.isTrusted else {
