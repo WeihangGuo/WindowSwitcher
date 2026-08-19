@@ -242,7 +242,12 @@ final class SwitcherController {
     /// nothing is left.
     private func closeWindow(_ window: WindowInfo) {
         WindowActivator.close(window) { [weak self] success in
-            guard let self, success, self.isVisible else { return }
+            guard let self, success else { return }
+            // Hide-on-close apps only order the window out; without this
+            // mark, invisible-window discovery would resurface the card
+            // the user just closed.
+            self.store.noteUserClosed(window.id)
+            guard self.isVisible else { return }
             self.model.removeWindow(id: window.id)
             if self.model.isEmpty {
                 self.dismiss()

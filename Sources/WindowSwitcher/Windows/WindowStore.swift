@@ -74,6 +74,12 @@ final class WindowStore {
     /// so each open doesn't repeat the scan. Cleared on Space change.
     private var attemptedBruteForce: [pid_t: Set<CGWindowID>] = [:]
 
+    /// Windows the user closed from the palette. Hide-on-close apps keep
+    /// the window alive (merely ordered out), and invisible-window discovery
+    /// would resurface it immediately — exclude such windows from listing
+    /// until the app itself shows them again (onscreen or focused).
+    private var userClosedIDs: Set<WindowID> = []
+
     /// Windows evicted by destroyed-notifications or dead-element repair.
     /// An in-flight axQueue snapshot may still contain them, so the insert
     /// paths must not resurrect them. The TTL comfortably exceeds any
@@ -289,6 +295,7 @@ final class WindowStore {
             windows.removeValue(forKey: id)
             titleDebounce.removeValue(forKey: id)?.cancel()
         }
+        userClosedIDs = userClosedIDs.filter { $0.pid != pid }
         if lastFocusedWindowID?.pid == pid {
             lastFocusedWindowID = nil
         }
@@ -431,6 +438,7 @@ final class WindowStore {
     private func removeWindow(id: WindowID) {
         windows.removeValue(forKey: id)
         titleDebounce.removeValue(forKey: id)?.cancel()
+        userClosedIDs.remove(id)
         tombstone(id)
         if lastFocusedWindowID == id {
             lastFocusedWindowID = nil
@@ -505,6 +513,8 @@ final class WindowStore {
 
     private func stampFocus(_ id: WindowID) {
         guard windows[id] != nil else { return }
+        // A focused window is visibly alive again — clear any user-closed mark.
+        userClosedIDs.remove(id)
         let stamp = nextStamp()
         windows[id]?.focusStamp = stamp
         appStamps[id.pid] = max(appStamps[id.pid] ?? 0, stamp)
@@ -519,6 +529,12 @@ final class WindowStore {
     func noteActivated(_ window: WindowInfo) {
         windows[window.id]?.isMinimized = false
         stampFocus(window.id)
+    }
+
+    /// The user closed this window from the palette: keep it out of the
+    /// listing even if the app only ordered it out instead of destroying it.
+    func noteUserClosed(_ id: WindowID) {
+        userClosedIDs.insert(id)
     }
 
     /// A raise/unminimize hit a dead element: drop it and repair.
@@ -728,6 +744,7 @@ final class WindowStore {
             // windows may be absent here, so they are never evicted by this.
             let allList = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
             var liveIDs = Set<CGWindowID>()
+            var onscreenIDs = Set<CGWindowID>()
             var liveByPid: [pid_t: Set<CGWindowID>] = [:]
             for entry in allList {
                 guard let number = entry[kCGWindowNumber as String] as? UInt32,
@@ -736,6 +753,9 @@ final class WindowStore {
                       watchedPids.contains(pid) else { continue }
                 liveIDs.insert(number)
                 liveByPid[pid, default: []].insert(number)
+                if (entry[kCGWindowIsOnscreen as String] as? Bool) == true {
+                    onscreenIDs.insert(number)
+                }
             }
 
             // Resolve listed windows we hold no element for (other-Space,
@@ -789,6 +809,12 @@ final class WindowStore {
                 for (pid, ids) in attempted {
                     self.attemptedBruteForce[pid, default: []].formUnion(ids)
                 }
+                // A user-closed window that the app re-shows (Dock click)
+                // is visibly alive again: bring it back to the listing.
+                self.userClosedIDs = self.userClosedIDs.filter { id in
+                    guard let cgID = self.windows[id]?.cgWindowID else { return false }
+                    return !onscreenIDs.contains(cgID)
+                }
                 // Evict only windows that no longer exist ANYWHERE: absent
                 // from the window server's all-Spaces list AND from their
                 // app's AX enumeration. Minimized windows, ⌘H-hidden apps'
@@ -815,7 +841,7 @@ final class WindowStore {
     /// quick-toggle initial selection and the current-window marker.
     func snapshotGroups() -> [AppWindowGroup] {
         var byApp: [pid_t: [WindowInfo]] = [:]
-        for info in windows.values {
+        for info in windows.values where !userClosedIDs.contains(info.id) {
             byApp[info.pid, default: []].append(info)
         }
         return byApp
