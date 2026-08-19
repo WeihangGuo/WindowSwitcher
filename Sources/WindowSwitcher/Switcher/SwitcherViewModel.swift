@@ -34,7 +34,7 @@ final class SwitcherViewModel: ObservableObject {
     /// Content size of the laid-out masonry (no panel padding).
     private(set) var contentSize: CGSize = .zero
 
-    private var columnCount = 1
+    private(set) var columnCount = 1
     /// Sticky group→column assignment so mid-session merges never reshuffle
     /// blocks between columns under the user's selection.
     private var columnAssignment: [pid_t: Int] = [:]
@@ -75,6 +75,15 @@ final class SwitcherViewModel: ObservableObject {
     /// A card was activated while the palette stays open.
     func markCurrent(_ id: WindowID) {
         currentWindowID = id
+    }
+
+    /// Re-select after a relayout reset selection state.
+    func restoreSelection(_ id: WindowID?) {
+        if let id, flat.contains(where: { $0.id == id }) {
+            selectedID = id
+        } else if selectedID == nil {
+            selectFirst()
+        }
     }
 
     /// Preselect the quick-toggle target: the most recently used window

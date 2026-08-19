@@ -131,6 +131,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async {
             controller.prewarm()
         }
+        // Warm-up reconcile: brute-force discovery of invisible/other-Space
+        // windows normally runs at palette-open; doing it once shortly after
+        // launch means the FIRST open already sees the full window set (and
+        // computes the right column count). Delayed so app watches register.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.store.reconcile { _ in }
+        }
     }
 
     private func trustMayHaveChanged() {

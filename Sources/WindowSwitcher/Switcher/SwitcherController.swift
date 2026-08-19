@@ -158,28 +158,7 @@ final class SwitcherController {
         model.load(groups: groups, columnCount: columnCount, currentWindowID: store.lastFocusedWindowID)
         model.selectInitial(preferring: store.previousWindowID())
 
-        // Size to content, capped at ~75% of the display's usable area.
-        // Anchor on the user's dragged position when it's still on screen;
-        // otherwise center. Clamp fully into the visible area either way.
-        let content = model.contentSize
-        let width = min(max(content.width, SwitcherLayout.columnWidth) + pad * 2, visible.width * 0.75)
-        let height = min(max(content.height, 80) + pad * 2, visible.height * 0.75)
-        var center = NSPoint(x: visible.midX, y: visible.midY)
-        if let draggedCenter, visible.contains(draggedCenter) {
-            center = draggedCenter
-        }
-        var frame = NSRect(
-            x: center.x - width / 2,
-            y: center.y - height / 2,
-            width: width,
-            height: height
-        )
-        frame.origin.x = min(max(frame.origin.x, visible.minX), visible.maxX - width)
-        frame.origin.y = min(max(frame.origin.y, visible.minY), visible.maxY - height)
-
-        isProgrammaticMove = true
-        panel.setFrame(frame.integral, display: false)
-        isProgrammaticMove = false
+        applyPanelFrame(on: screen)
         isVisible = true
         panel.makeKeyAndOrderFront(nil)
         installMonitors()
@@ -210,9 +189,13 @@ final class SwitcherController {
         }
 
         // Panel is already on screen from cache; repair drift asynchronously.
+        // Discovery can add many windows on a cold cache — if that changes
+        // the ideal column count, relayout ONCE now (live merges afterwards
+        // never reflow under the user).
         store.reconcile { [weak self] fresh in
             guard let self, self.isVisible else { return }
             self.model.merge(fresh: fresh)
+            self.relayoutAfterDiscovery(on: screen)
         }
 
         // Live per-app RAM readout; sampled only while visible so idle
@@ -406,6 +389,48 @@ final class SwitcherController {
     }
 
     // MARK: - Layout
+
+    /// Size to content, capped at ~75% of the display's usable area.
+    /// Anchor on the user's dragged position when it's still on screen;
+    /// otherwise center. Clamp fully into the visible area either way.
+    private func applyPanelFrame(on screen: NSScreen) {
+        let visible = screen.visibleFrame
+        let pad = SwitcherLayout.panelPadding
+        let content = model.contentSize
+        let width = min(max(content.width, SwitcherLayout.columnWidth) + pad * 2, visible.width * 0.75)
+        let height = min(max(content.height, 80) + pad * 2, visible.height * 0.75)
+        var center = NSPoint(x: visible.midX, y: visible.midY)
+        if let draggedCenter, visible.contains(draggedCenter) {
+            center = draggedCenter
+        }
+        var frame = NSRect(
+            x: center.x - width / 2,
+            y: center.y - height / 2,
+            width: width,
+            height: height
+        )
+        frame.origin.x = min(max(frame.origin.x, visible.minX), visible.maxX - width)
+        frame.origin.y = min(max(frame.origin.y, visible.minY), visible.maxY - height)
+
+        isProgrammaticMove = true
+        panel.setFrame(frame.integral, display: true)
+        isProgrammaticMove = false
+    }
+
+    private func relayoutAfterDiscovery(on screen: NSScreen) {
+        let visible = screen.visibleFrame
+        let pad = SwitcherLayout.panelPadding
+        let columns = computeColumnCount(
+            groups: model.groups,
+            maxContentWidth: visible.width * 0.75 - pad * 2,
+            maxContentHeight: visible.height * 0.75 - pad * 2
+        )
+        guard columns != model.columnCount else { return }
+        let selected = model.selectedID
+        model.load(groups: model.groups, columnCount: columns, currentWindowID: model.currentWindowID)
+        model.restoreSelection(selected)
+        applyPanelFrame(on: screen)
+    }
 
     /// The display currently being used: the one with the pointer.
     private func targetScreen() -> NSScreen? {
