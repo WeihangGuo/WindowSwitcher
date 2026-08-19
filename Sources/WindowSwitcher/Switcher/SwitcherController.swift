@@ -247,6 +247,18 @@ final class SwitcherController {
             // mark, invisible-window discovery would resurface the card
             // the user just closed.
             self.store.noteUserClosed(window.id)
+
+            // Closing an app's LAST window means the user is done with the
+            // app: quit it gracefully (unsaved-changes prompts still appear)
+            // so it doesn't linger in the Dock. Never quit Finder.
+            let remaining = self.store.snapshotGroups()
+                .first { $0.id == window.pid }?.windows.count ?? 0
+            if remaining == 0,
+               let app = NSRunningApplication(processIdentifier: window.pid),
+               app.bundleIdentifier != "com.apple.finder" {
+                app.terminate()
+            }
+
             guard self.isVisible else { return }
             self.model.removeWindow(id: window.id)
             if self.model.isEmpty {
