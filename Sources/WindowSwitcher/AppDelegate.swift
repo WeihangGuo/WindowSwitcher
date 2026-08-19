@@ -57,11 +57,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Debug hook: `distributed-notify dev.window-manager.WindowSwitcher.debugDump`
+        // makes the app reconcile and write its live window store to
+        // /tmp/windowswitcher-dump.txt (local file, diagnostic use).
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("dev.window-manager.WindowSwitcher.debugDump"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.writeDebugDump()
+        }
+
         if AX.isTrusted {
             startCore()
         } else {
             AX.promptForTrustIfNeeded()
             showOnboarding()
+        }
+    }
+
+    private func writeDebugDump() {
+        var header = "trusted: \(AX.isTrusted) coreStarted: \(coreStarted)\n"
+        guard coreStarted else {
+            try? header.write(toFile: "/tmp/windowswitcher-dump.txt", atomically: true, encoding: .utf8)
+            return
+        }
+        header += store.debugSummary
+        store.reconcile { [weak self] groups in
+            header += self?.store.lastReconcileDiag ?? ""
+            for group in groups {
+                header += "\(group.appName) [pid \(group.id)]\n"
+                for window in group.windows {
+                    header += "  - '\(window.title)' min:\(window.isMinimized) fs:\(window.isFullscreen) cg:\(window.cgWindowID ?? 0)\n"
+                }
+            }
+            try? header.write(toFile: "/tmp/windowswitcher-dump.txt", atomically: true, encoding: .utf8)
         }
     }
 

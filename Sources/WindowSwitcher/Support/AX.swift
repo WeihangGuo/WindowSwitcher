@@ -65,7 +65,20 @@ enum RemoteToken {
             guard let element = create(token as CFData)?.takeRetainedValue(),
                   let windowID = element.cgWindowID,
                   remaining.contains(windowID) else { continue }
-            found[windowID] = element
+            // _AXUIElementGetWindow answers for ANY element inside the
+            // window (buttons, fields…), and the window element's own ID may
+            // sit far outside the scan range (Qt apps). Climb the parent
+            // chain from whatever we hit up to the containing window.
+            var candidateElement = element
+            var hops = 0
+            while candidateElement.string(kAXRoleAttribute) != kAXWindowRole, hops < 20 {
+                guard let parent = candidateElement.element(kAXParentAttribute) else { break }
+                candidateElement = parent
+                hops += 1
+            }
+            guard candidateElement.string(kAXRoleAttribute) == kAXWindowRole,
+                  candidateElement.cgWindowID == windowID else { continue }
+            found[windowID] = candidateElement
             remaining.remove(windowID)
             if remaining.isEmpty { break }
         }

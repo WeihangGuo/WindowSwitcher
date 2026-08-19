@@ -84,6 +84,15 @@ final class WindowStore {
     /// Pending title-changed debounce work, per window.
     private var titleDebounce: [WindowID: DispatchWorkItem] = [:]
 
+    /// Diagnostics from the most recent reconcile, for the debug dump.
+    private(set) var lastReconcileDiag = ""
+
+    var debugSummary: String {
+        let watched = appNames.map { "\($0.key):\($0.value)\(observers[$0.key] == nil ? "(watchless)" : "")" }
+            .sorted().joined(separator: ", ")
+        return "watched: \(watched)\npendingWatch: \(pendingWatch.sorted())\nhidden: \(hiddenPids.sorted())\n"
+    }
+
     private let ownPID = ProcessInfo.processInfo.processIdentifier
     private var workspaceObservers: [NSObjectProtocol] = []
 
@@ -136,12 +145,17 @@ final class WindowStore {
         ) { [weak self] note in
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             self?.hiddenPids.insert(app.processIdentifier)
+            // Visibility changed: previously unresolvable windows may
+            // resolve now — let the next reconcile retry them.
+            self?.attemptedBruteForce.removeValue(forKey: app.processIdentifier)
         })
         workspaceObservers.append(center.addObserver(
             forName: NSWorkspace.didUnhideApplicationNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             self?.hiddenPids.remove(app.processIdentifier)
+            self?.attemptedBruteForce.removeValue(forKey: app.processIdentifier)
+            self?.upgradeWatchIfNeeded(pid: app.processIdentifier)
             self?.refreshApp(pid: app.processIdentifier)
         })
 
@@ -221,12 +235,37 @@ final class WindowStore {
     }
 
     private func scheduleWatchRetry(pid: pid_t, name: String, bundleID: String?, retryDelay: TimeInterval) {
-        guard retryDelay < 16 else { return }
+        guard retryDelay < 16 else {
+            // Observer registration keeps failing (hidden apps can refuse
+            // it entirely). Adopt the app WITHOUT an observer so reconcile
+            // fetch + brute force still cover it; upgraded to a full watch
+            // when the app later activates or unhides.
+            adoptWatchless(pid: pid, name: name, bundleID: bundleID)
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + retryDelay) { [weak self] in
             guard let self, self.observers[pid] == nil, !self.pendingWatch.contains(pid),
                   let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return }
             self.watchApp(pid: pid, name: name, bundleID: bundleID, retryDelay: retryDelay * 2)
         }
+    }
+
+    private func adoptWatchless(pid: pid_t, name: String, bundleID: String?) {
+        guard observers[pid] == nil, appElements[pid] == nil,
+              let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return }
+        appElements[pid] = AXUIElement.application(pid: pid)
+        appNames[pid] = name
+        appBundleIDs[pid] = bundleID
+        IconCache.shared.prepare(pid: pid)
+        refreshApp(pid: pid)
+    }
+
+    /// Watchless apps get a real observer once they come back to life.
+    private func upgradeWatchIfNeeded(pid: pid_t) {
+        guard observers[pid] == nil, !pendingWatch.contains(pid),
+              let app = NSRunningApplication(processIdentifier: pid) else { return }
+        appElements.removeValue(forKey: pid) // let watchApp rebuild cleanly
+        watchAppIfEligible(app)
     }
 
     private func unwatchApp(pid: pid_t) {
@@ -434,6 +473,7 @@ final class WindowStore {
 
     private func appDidActivate(_ pid: pid_t) {
         guard pid != ownPID else { return }
+        upgradeWatchIfNeeded(pid: pid)
         appStamps[pid] = nextStamp()
         // The app's own kAXFocusedWindowChanged normally follows and stamps
         // the window; a delayed read covers apps that never post it.
@@ -541,16 +581,41 @@ final class WindowStore {
         return elements.compactMap { buildWindowInfo($0, pid: pid, appName: appName) }
     }
 
-    private static func buildWindowInfo(_ element: AXUIElement, pid: pid_t, appName: String) -> WindowInfo? {
-        // One Mach round trip for all attributes.
-        guard let values = element.multiValues([
+    private static func buildWindowInfo(_ element: AXUIElement, pid: pid_t, appName: String, allowDialogSubrole: Bool = false) -> WindowInfo? {
+        let role: String?
+        let subrole: String?
+        let title: String?
+        let minimized: Bool
+        let fullscreen: Bool
+        // One Mach round trip for all attributes...
+        if let values = element.multiValues([
             kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute, kAXMinimizedAttribute, "AXFullScreen",
-        ]) else { return nil }
-        guard (values[0] as? String) == kAXWindowRole else { return nil }
+        ]) {
+            role = values[0] as? String
+            subrole = values[1] as? String
+            title = values[2] as? String
+            minimized = values[3] as? Bool ?? false
+            fullscreen = values[4] as? Bool ?? false
+        } else {
+            // ...but batched reads can fail wholesale on brute-forced
+            // (remote-token) elements where individual reads succeed.
+            guard let individualRole = element.string(kAXRoleAttribute) else { return nil }
+            role = individualRole
+            subrole = element.string(kAXSubroleAttribute)
+            title = element.string(kAXTitleAttribute)
+            minimized = element.bool(kAXMinimizedAttribute) ?? false
+            fullscreen = element.bool("AXFullScreen") ?? false
+        }
+        guard role == kAXWindowRole else { return nil }
         // Standard windows only: excludes floating panels, tooltips, popovers.
         // Accept a missing subrole (some non-native toolkits omit it).
-        if let subrole = values[1] as? String, subrole != kAXStandardWindowSubrole {
-            return nil
+        // Invisible windows (⌘H-hidden, ✕-closed-but-alive) misreport their
+        // subrole as AXDialog, so the brute-force discovery path relaxes
+        // the filter to dialogs — but only TITLED ones: untitled dialogs
+        // found this way are ghost sheets/panels (verified empirically).
+        if let subrole, subrole != kAXStandardWindowSubrole {
+            guard allowDialogSubrole, subrole == kAXDialogSubrole,
+                  !(title ?? "").isEmpty else { return nil }
         }
         let cgID = element.cgWindowID
         let key = cgID.map { UInt64($0) } ?? UInt64(bitPattern: Int64(CFHash(element)))
@@ -560,9 +625,9 @@ final class WindowStore {
             pid: pid,
             appName: appName,
             cgWindowID: cgID,
-            title: values[2] as? String ?? "",
-            isMinimized: values[3] as? Bool ?? false,
-            isFullscreen: values[4] as? Bool ?? false,
+            title: title ?? "",
+            isMinimized: minimized,
+            isFullscreen: fullscreen,
             focusStamp: 0
         )
     }
@@ -646,14 +711,17 @@ final class WindowStore {
             }
         }
         let alreadyAttempted = attemptedBruteForce
+        let hiddenSnapshot = hiddenPids
 
         WindowStore.axQueue.async { [weak self] in
+            var diag = ""
             var fetchResults: [(pid_t, [WindowInfo]?)] = []
             var responsivePids = Set<pid_t>()
             for app in apps {
                 let fetched = WindowStore.fetchWindows(appElement: app.element, pid: app.pid, appName: app.name)
                 if fetched != nil { responsivePids.insert(app.pid) }
                 fetchResults.append((app.pid, fetched))
+                diag += "fetch \(app.name)[\(app.pid)]: \(fetched.map { "\($0.count)" } ?? "nil")\n"
             }
 
             // All-Spaces ground truth. Layer 0 = standard windows. Minimized
@@ -675,8 +743,13 @@ final class WindowStore {
             // they get resolved on the first reconcile after recovery.
             var resolved: [(pid_t, [WindowInfo])] = []
             var attempted: [pid_t: Set<CGWindowID>] = [:]
+            // Hidden (⌘H) apps refuse kAXWindowsAttribute enumeration
+            // entirely, so a failed fetch there does NOT mean unresponsive —
+            // brute force is the ONLY discovery path for apps hidden before
+            // we launched (verified empirically). The wall-clock budget in
+            // resolveElements bounds the damage if such an app is truly hung.
             if RemoteToken.isAvailable {
-                for app in apps where responsivePids.contains(app.pid) {
+                for app in apps where responsivePids.contains(app.pid) || hiddenSnapshot.contains(app.pid) {
                     let missing = (liveByPid[app.pid] ?? [])
                         .subtracting(knownIDsByPid[app.pid] ?? [])
                         .subtracting(alreadyAttempted[app.pid] ?? [])
@@ -684,16 +757,24 @@ final class WindowStore {
                     attempted[app.pid] = missing
                     let elements = RemoteToken.resolveElements(pid: app.pid, targetWindowIDs: missing)
                     let infos = elements.values.compactMap {
-                        WindowStore.buildWindowInfo($0, pid: app.pid, appName: app.name)
+                        WindowStore.buildWindowInfo($0, pid: app.pid, appName: app.name, allowDialogSubrole: true)
                     }
+                    diag += "bruteforce \(app.name)[\(app.pid)]: targets=\(missing.count) resolvedWindows=\(elements.count) eligible=\(infos.count)\n"
                     if !infos.isEmpty {
                         resolved.append((app.pid, infos))
                     }
                 }
             }
 
+            // Windows the apps' own AX enumeration still reports. A window
+            // can be absent from the window server (red-✕ "closed" but only
+            // ordered out — Telegram/WeChat-style) yet fully alive and
+            // raisable; such windows must stay listed.
+            let axListedIDs = Set(fetchResults.flatMap { $0.1 ?? [] }.map(\.id))
+
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.lastReconcileDiag = diag
                 for (pid, fetched) in fetchResults {
                     if let fetched {
                         self.noteFetchSucceeded(pid: pid)
@@ -708,14 +789,17 @@ final class WindowStore {
                 for (pid, ids) in attempted {
                     self.attemptedBruteForce[pid, default: []].formUnion(ids)
                 }
-                // Evict windows that no longer exist anywhere. Minimized
-                // windows and windows of ⌘H-hidden apps are exempt (both
-                // are absent from the window server's list while alive).
+                // Evict only windows that no longer exist ANYWHERE: absent
+                // from the window server's all-Spaces list AND from their
+                // app's AX enumeration. Minimized windows, ⌘H-hidden apps'
+                // windows, and ✕-closed-but-alive (ordered-out) windows all
+                // fail only one of the two checks and stay listed.
                 for (id, info) in self.windows {
                     guard let cgID = info.cgWindowID,
                           !info.isMinimized,
                           !self.hiddenPids.contains(id.pid),
-                          !liveIDs.contains(cgID) else { continue }
+                          !liveIDs.contains(cgID),
+                          !axListedIDs.contains(id) else { continue }
                     self.removeWindow(id: id)
                 }
                 completion(self.snapshotGroups())
